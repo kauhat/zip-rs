@@ -3,6 +3,7 @@ use std::collections::HashSet;
 use std::io::prelude::*;
 use std::io::{Cursor, Seek};
 use std::iter::FromIterator;
+use zip::read::ZipFile;
 use zip::write::FileOptions;
 use zip::{CompressionMethod, SUPPORTED_METHODS};
 
@@ -11,13 +12,18 @@ use zip::{CompressionMethod, SUPPORTED_METHODS};
 #[test]
 fn end_to_end() {
     for &method in SUPPORTED_METHODS {
-        let file = &mut Cursor::new(Vec::new());
+        // Setup a buffer we can write and read an archive to.
+        let buffer = &mut Cursor::new(Vec::new());
 
+        // Write a test archive to the buffer.
         println!("Writing file with {} compression", method);
-        write_test_archive(file, method).expect("Couldn't write test zip archive");
+        write_test_archive(buffer, method).expect("Couldn't write test zip archive");
+
+        // Load a fresh ZipArchive from the buffer data.
+        let mut archive = zip::ZipArchive::new(buffer).expect("Couldn't load test archive");
 
         println!("Checking file contents");
-        check_archive_file(file, ENTRY_NAME, Some(method), LOREM_IPSUM);
+        check_test_archive(&mut archive, Some(method));
     }
 }
 
@@ -26,17 +32,17 @@ fn end_to_end() {
 #[test]
 fn copy() {
     for &method in SUPPORTED_METHODS {
-        let src_file = &mut Cursor::new(Vec::new());
-        write_test_archive(src_file, method).expect("Couldn't write to test file");
+        let buf_source = &mut Cursor::new(Vec::new());
+        write_test_archive(buf_source, method).expect("Couldn't write to test file");
 
-        let mut tgt_file = &mut Cursor::new(Vec::new());
+        let mut buf_target = &mut Cursor::new(Vec::new());
 
         {
-            let mut src_archive = zip::ZipArchive::new(src_file).unwrap();
-            let mut zip = zip::ZipWriter::new(&mut tgt_file);
+            let mut archive_source = zip::ZipArchive::new(buf_source).unwrap();
+            let mut zip = zip::ZipWriter::new(&mut buf_target);
 
             {
-                let file = src_archive
+                let file = archive_source
                     .by_name(ENTRY_NAME)
                     .expect("Missing expected file");
 
@@ -44,7 +50,7 @@ fn copy() {
             }
 
             {
-                let file = src_archive
+                let file = archive_source
                     .by_name(ENTRY_NAME)
                     .expect("Missing expected file");
 
@@ -53,10 +59,15 @@ fn copy() {
             }
         }
 
-        let mut tgt_archive = zip::ZipArchive::new(tgt_file).unwrap();
-
-        check_archive_file_contents(&mut tgt_archive, ENTRY_NAME, LOREM_IPSUM);
-        check_archive_file_contents(&mut tgt_archive, COPY_ENTRY_NAME, LOREM_IPSUM);
+        let mut archive_target = zip::ZipArchive::new(buf_target).unwrap();
+        check_test_archive(&mut archive_target, Some(method));
+        check_archive_file(&mut archive_target, ENTRY_NAME, Some(method), LOREM_IPSUM);
+        check_archive_file(
+            &mut archive_target,
+            COPY_ENTRY_NAME,
+            Some(method),
+            LOREM_IPSUM,
+        );
     }
 }
 
@@ -80,8 +91,9 @@ fn append() {
         }
 
         let mut zip = zip::ZipArchive::new(&mut file).unwrap();
-        check_archive_file_contents(&mut zip, ENTRY_NAME, LOREM_IPSUM);
-        check_archive_file_contents(&mut zip, COPY_ENTRY_NAME, LOREM_IPSUM);
+        check_test_archive(&mut zip, Some(method));
+        check_archive_file(&mut zip, ENTRY_NAME, Some(method), LOREM_IPSUM);
+        check_archive_file(&mut zip, COPY_ENTRY_NAME, Some(method), LOREM_IPSUM);
     }
 }
 
@@ -101,7 +113,7 @@ fn write_test_archive(
     zip.start_file("test/☃.txt", options)?;
     zip.write_all(b"Hello, World!\n")?;
 
-    zip.start_file_with_extra_data("test_with_extra_data/🐢.txt", options)?;
+    zip.start_file_with_extra_data(EXTRA_ENTRY_NAME, options)?;
     zip.write_u16::<LittleEndian>(0xbeef)?;
     zip.write_u16::<LittleEndian>(EXTRA_DATA.len() as u16)?;
     zip.write_all(EXTRA_DATA)?;
@@ -112,64 +124,55 @@ fn write_test_archive(
     zip.write_all(LOREM_IPSUM)?;
 
     zip.finish()?;
+
     Ok(())
 }
 
 // Load an archive from buffer and check for test data.
-fn check_test_archive<R: Read + Seek>(zip_file: R) -> zip::result::ZipResult<zip::ZipArchive<R>> {
-    let mut archive = zip::ZipArchive::new(zip_file).unwrap();
+fn check_test_archive<R: Read + Seek>(archive: &mut zip::ZipArchive<R>, method: Option<CompressionMethod>) {
+    check_archive_file(archive, ENTRY_NAME, method, LOREM_IPSUM);
+    // check_archive_file(archive, EXTRA_ENTRY_NAME, method, LOREM_IPSUM);
 
     // Check archive contains expected file names.
     {
         let expected_file_names = [
             "test/",
             "test/☃.txt",
-            "test_with_extra_data/🐢.txt",
+            EXTRA_ENTRY_NAME,
             ENTRY_NAME,
         ];
         let expected_file_names = HashSet::from_iter(expected_file_names.iter().copied());
         let file_names = archive.file_names().collect::<HashSet<_>>();
-        assert_eq!(file_names, expected_file_names);
+        assert_eq!(file_names, expected_file_names, "Archive file names differ");
     }
 
     // Check an archive file for extra data field contents.
-    {
-        let file_with_extra_data = archive.by_name("test_with_extra_data/🐢.txt")?;
+    (|| -> zip::result::ZipResult<()> {
+        let file_with_extra_data = archive.by_name(EXTRA_ENTRY_NAME)?;
+
         let mut extra_data = Vec::new();
         extra_data.write_u16::<LittleEndian>(0xbeef)?;
         extra_data.write_u16::<LittleEndian>(EXTRA_DATA.len() as u16)?;
         extra_data.write_all(EXTRA_DATA)?;
+
         assert_eq!(file_with_extra_data.extra_data(), extra_data.as_slice());
-    }
 
-    Ok(archive)
-}
-
-// Read a file in the archive as a string.
-fn read_archive_file<R: Read + Seek>(
-    archive: &mut zip::ZipArchive<R>,
-    name: &str,
-) -> zip::result::ZipResult<String> {
-    let mut file = archive.by_name(name)?;
-
-    let mut contents = String::new();
-    file.read_to_string(&mut contents).unwrap();
-
-    Ok(contents)
+        Ok(())
+    }())
+    .expect("Could not check test file with extra data in archive");
 }
 
 // Check a file in the archive contains expected data and properties.
-fn check_archive_file(
-    zip_file: &mut Cursor<Vec<u8>>,
+fn check_archive_file<R: Read + Seek>(
+    archive: &mut zip::ZipArchive<R>,
     name: &str,
     expected_method: Option<CompressionMethod>,
     expected_data: &[u8],
 ) {
-    let mut archive = check_test_archive(zip_file).unwrap();
+    let mut file = archive.by_name(name).expect("Couldn not find file by name");
 
     if let Some(expected_method) = expected_method {
         // Check the file's compression method.
-        let file = archive.by_name(name).unwrap();
         let real_method = file.compression();
 
         assert_eq!(
@@ -178,16 +181,15 @@ fn check_archive_file(
         );
     }
 
-    check_archive_file_contents(&mut archive, name, expected_data);
+    // Compare the file's contents.
+    check_archive_file_contents(&mut file, expected_data);
 }
 
-// Check a file in the archive contains the given data.
-fn check_archive_file_contents<R: Read + Seek>(
-    archive: &mut zip::ZipArchive<R>,
-    name: &str,
-    expected: &[u8],
-) {
-    let file_contents: String = read_archive_file(archive, name).unwrap();
+// Check a file contains the given data.
+fn check_archive_file_contents(file: &mut ZipFile, expected: &[u8]) {
+    let mut file_contents = String::new();
+    file.read_to_string(&mut file_contents).unwrap();
+
     assert_eq!(file_contents.as_bytes(), expected);
 }
 
@@ -203,3 +205,5 @@ const EXTRA_DATA: &[u8] = b"Extra Data";
 const ENTRY_NAME: &str = "test/lorem_ipsum.txt";
 
 const COPY_ENTRY_NAME: &str = "test/lorem_ipsum_renamed.txt";
+
+const EXTRA_ENTRY_NAME: &str =" test_with_extra_data/🐢.txt";
