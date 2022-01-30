@@ -155,6 +155,8 @@ pub const SUPPORTED_COMPRESSION_METHODS: &[CompressionMethod] = &[
     CompressionMethod::Bzip2,
     #[cfg(feature = "zstd")]
     CompressionMethod::Zstd,
+    #[cfg(feature = "aes-crypto")]
+    CompressionMethod::Aes,
 ];
 
 #[cfg(test)]
