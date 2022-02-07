@@ -1,21 +1,21 @@
-use criterion::{criterion_group, criterion_main};
-use criterion::{BenchmarkId, Criterion};
+use bencher::{benchmark_group, benchmark_main};
 
 use std::io::{Cursor, Read, Write};
 
 use getrandom::getrandom;
 use strum::IntoEnumIterator;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
+use bencher::Bencher;
+use getrandom::getrandom;
+use zip::{ZipArchive, ZipWriter};
 
-fn generate_random_archive(size: usize, method: Option<CompressionMethod>) -> Vec<u8> {
+fn generate_random_archive(size: usize) -> Vec<u8> {
     let data = Vec::new();
     let mut writer = ZipWriter::new(Cursor::new(data));
-    let options = zip::write::FileOptions::default()
-        .compression_method(method.unwrap_or(CompressionMethod::Stored));
+    let options =
+        zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
 
     writer.start_file("random.dat", options).unwrap();
-
-    // Generate some random data.
     let mut bytes = vec![0u8; size];
     getrandom(&mut bytes).unwrap();
     writer.write_all(&bytes).unwrap();
@@ -23,7 +23,7 @@ fn generate_random_archive(size: usize, method: Option<CompressionMethod>) -> Ve
     writer.finish().unwrap().into_inner()
 }
 
-fn read_entry(bench: &mut Criterion) {
+fn read_entry(bench: &mut Bencher) {
     let size = 1024 * 1024;
     let mut group = bench.benchmark_group("read_entry");
     for method in CompressionMethod::iter() {
