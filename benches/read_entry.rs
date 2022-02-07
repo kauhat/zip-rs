@@ -4,8 +4,8 @@ use criterion::{BenchmarkId, Criterion};
 use std::io::{Cursor, Read, Write};
 
 use getrandom::getrandom;
-use strum::IntoEnumIterator;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
+use zip::SUPPORTED_COMPRESSION_METHODS;
 
 fn generate_random_archive(size: usize, method: Option<CompressionMethod>) -> Vec<u8> {
     let data = Vec::new();
@@ -26,7 +26,7 @@ fn generate_random_archive(size: usize, method: Option<CompressionMethod>) -> Ve
 fn read_entry(bench: &mut Criterion) {
     let size = 1024 * 1024;
     let mut group = bench.benchmark_group("read_entry");
-    for method in CompressionMethod::iter() {
+    for &method in SUPPORTED_COMPRESSION_METHODS {
         #[allow(deprecated)]
         if method == CompressionMethod::Unsupported(0) {
             continue;
@@ -61,7 +61,7 @@ fn read_entry(bench: &mut Criterion) {
 fn write_random_archive(bench: &mut Criterion) {
     let size = 1024 * 1024;
     let mut group = bench.benchmark_group("write_random_archive");
-    for method in CompressionMethod::iter() {
+    for &method in SUPPORTED_COMPRESSION_METHODS {
         #[allow(deprecated)]
         if method == CompressionMethod::Unsupported(0) {
             continue;
