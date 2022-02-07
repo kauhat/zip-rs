@@ -4,7 +4,7 @@ use crate::compression::CompressionMethod;
 use crate::read::{central_header_to_zip_file, ZipArchive, ZipFile};
 use crate::result::{ZipError, ZipResult};
 use crate::spec;
-use crate::types::{DateTime, System, ZipFileData, DEFAULT_VERSION};
+use crate::types::{AtomicU64, DateTime, System, ZipFileData, DEFAULT_VERSION};
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use crc32fast::Hasher;
 use std::default::Default;
@@ -21,6 +21,9 @@ use flate2::write::DeflateEncoder;
 
 #[cfg(feature = "bzip2")]
 use bzip2::write::BzEncoder;
+
+#[cfg(feature = "time")]
+use time::OffsetDateTime;
 
 #[cfg(feature = "zstd")]
 use zstd::stream::write::Encoder as ZstdEncoder;
@@ -118,7 +121,7 @@ impl FileOptions {
             )))]
             compression_method: CompressionMethod::Stored,
             #[cfg(feature = "time")]
-            last_modified_time: DateTime::from_time(time::now()).unwrap_or_default(),
+            last_modified_time: DateTime::from_time(OffsetDateTime::now_utc()).unwrap_or_default(),
             #[cfg(not(feature = "time"))]
             last_modified_time: DateTime::default(),
             permissions: None,
@@ -130,6 +133,7 @@ impl FileOptions {
     ///
     /// The default is `CompressionMethod::Deflated`. If the deflate compression feature is
     /// disabled, `CompressionMethod::Stored` becomes the default.
+    #[must_use]
     pub fn compression_method(mut self, method: CompressionMethod) -> FileOptions {
         self.compression_method = method;
         self
@@ -139,6 +143,7 @@ impl FileOptions {
     ///
     /// The default is the current timestamp if the 'time' feature is enabled, and 1980-01-01
     /// otherwise
+    #[must_use]
     pub fn last_modified_time(mut self, mod_time: DateTime) -> FileOptions {
         self.last_modified_time = mod_time;
         self
@@ -149,6 +154,7 @@ impl FileOptions {
     /// The format is represented with unix-style permissions.
     /// The default is `0o644`, which represents `rw-r--r--` for files,
     /// and `0o755`, which represents `rwxr-xr-x` for directories
+    #[must_use]
     pub fn unix_permissions(mut self, mode: u32) -> FileOptions {
         self.permissions = Some(mode & 0o777);
         self
@@ -159,6 +165,7 @@ impl FileOptions {
     /// If set to `false` and the file exceeds the limit, an I/O error is thrown. If set to `true`,
     /// readers will require ZIP64 support and if the file does not exceed the limit, 20 B are
     /// wasted. The default is `false`.
+    #[must_use]
     pub fn large_file(mut self, large: bool) -> FileOptions {
         self.large_file = large;
         self
@@ -239,7 +246,10 @@ impl<A: Read + Write + io::Seek> ZipWriter<A> {
         let (archive_offset, directory_start, number_of_files) =
             ZipArchive::get_directory_counts(&mut readwriter, &footer, cde_start_pos)?;
 
-        if let Err(_) = readwriter.seek(io::SeekFrom::Start(directory_start)) {
+        if readwriter
+            .seek(io::SeekFrom::Start(directory_start))
+            .is_err()
+        {
             return Err(ZipError::InvalidArchive(
                 "Could not seek to start of central directory",
             ));
@@ -309,7 +319,7 @@ impl<W: Write + io::Seek> ZipWriter<W> {
     {
         self.finish_file()?;
 
-        let raw_values = raw_values.unwrap_or_else(|| ZipRawValues {
+        let raw_values = raw_values.unwrap_or(ZipRawValues {
             crc32: 0,
             compressed_size: 0,
             uncompressed_size: 0,
@@ -335,16 +345,17 @@ impl<W: Write + io::Seek> ZipWriter<W> {
                 extra_field: Vec::new(),
                 file_comment: String::new(),
                 header_start,
-                data_start: 0,
+                data_start: AtomicU64::new(0),
                 central_header_start: 0,
                 external_attributes: permissions << 16,
                 large_file: options.large_file,
+                aes_mode: None,
             };
             write_local_file_header(writer, &file)?;
 
             let header_end = writer.seek(io::SeekFrom::Current(0))?;
             self.stats.start = header_end;
-            file.data_start = header_end;
+            *file.data_start.get_mut() = header_end;
 
             self.stats.bytes_written = 0;
             self.stats.hasher = Hasher::new();
@@ -523,7 +534,7 @@ impl<W: Write + io::Seek> ZipWriter<W> {
         self.start_entry(name, options, None)?;
         self.writing_to_file = true;
         self.writing_to_extra_field = true;
-        Ok(self.files.last().unwrap().data_start)
+        Ok(self.files.last().unwrap().data_start.load())
     }
 
     /// End local and start central extra data. Requires [`ZipWriter::start_file_with_extra_data`].
@@ -550,7 +561,9 @@ impl<W: Write + io::Seek> ZipWriter<W> {
         }
         let file = self.files.last_mut().unwrap();
 
-        validate_extra_data(&file)?;
+        validate_extra_data(file)?;
+
+        let data_start = file.data_start.get_mut();
 
         if !self.writing_to_central_extra_field_only {
             let writer = self.inner.get_plain();
@@ -559,9 +572,9 @@ impl<W: Write + io::Seek> ZipWriter<W> {
             writer.write_all(&file.extra_field)?;
 
             // Update final `data_start`.
-            let header_end = file.data_start + file.extra_field.len() as u64;
+            let header_end = *data_start + file.extra_field.len() as u64;
             self.stats.start = header_end;
-            file.data_start = header_end;
+            *data_start = header_end;
 
             // Update extra field length in local file header.
             let extra_field_length =
@@ -575,7 +588,7 @@ impl<W: Write + io::Seek> ZipWriter<W> {
 
         self.writing_to_extra_field = false;
         self.writing_to_central_extra_field_only = false;
-        Ok(file.data_start)
+        Ok(*data_start)
     }
 
     /// Add a new file using the already compressed data from a ZIP file being read and renames it, this
@@ -608,11 +621,11 @@ impl<W: Write + io::Seek> ZipWriter<W> {
     where
         S: Into<String>,
     {
-        let options = FileOptions::default()
+        let mut options = FileOptions::default()
             .last_modified_time(file.last_modified())
             .compression_method(file.compression());
         if let Some(perms) = file.unix_mode() {
-            options.unix_permissions(perms);
+            options = options.unix_permissions(perms);
         }
 
         let raw_values = ZipRawValues {
@@ -779,7 +792,7 @@ impl<W: Write + io::Seek> Drop for ZipWriter<W> {
     fn drop(&mut self) {
         if !self.inner.is_closed() {
             if let Err(e) = self.finalize() {
-                let _ = write!(&mut io::stderr(), "ZipWriter drop failed: {:?}", e);
+                let _ = write!(io::stderr(), "ZipWriter drop failed: {:?}", e);
             }
         }
     }
@@ -837,6 +850,11 @@ impl<W: Write + io::Seek> GenericZipWriter<W> {
                 CompressionMethod::Bzip2 => {
                     GenericZipWriter::Bzip2(BzEncoder::new(bare, bzip2::Compression::default()))
                 }
+                CompressionMethod::AES => {
+                    return Err(ZipError::UnsupportedArchive(
+                        "AES compression is not supported for writing",
+                    ))
+                }
                 #[cfg(feature = "zstd")]
                 CompressionMethod::Zstd => {
                     GenericZipWriter::Zstd(ZstdEncoder::new(bare, 0).unwrap())
@@ -868,10 +886,7 @@ impl<W: Write + io::Seek> GenericZipWriter<W> {
     }
 
     fn is_closed(&self) -> bool {
-        match *self {
-            GenericZipWriter::Closed => true,
-            _ => false,
-        }
+        matches!(*self, GenericZipWriter::Closed)
     }
 
     fn get_plain(&mut self) -> &mut W {
@@ -947,7 +962,7 @@ fn write_local_file_header<T: Write>(writer: &mut T, file: &ZipFileData) -> ZipR
     writer.write_all(file.file_name.as_bytes())?;
     // zip64 extra field
     if file.large_file {
-        write_local_zip64_extra_field(writer, &file)?;
+        write_local_zip64_extra_field(writer, file)?;
     }
 
     Ok(())
@@ -1065,7 +1080,7 @@ fn validate_extra_data(file: &ZipFileData) -> ZipResult<()> {
         )));
     }
 
-    while data.len() > 0 {
+    while !data.is_empty() {
         let left = data.len();
         if left < 4 {
             return Err(ZipError::Io(io::Error::new(
@@ -1245,7 +1260,7 @@ mod test {
         };
         writer.start_file("mimetype", options).unwrap();
         writer
-            .write(b"application/vnd.oasis.opendocument.text")
+            .write_all(b"application/vnd.oasis.opendocument.text")
             .unwrap();
         let result = writer.finish().unwrap();
 
