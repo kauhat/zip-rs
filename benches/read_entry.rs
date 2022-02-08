@@ -6,9 +6,6 @@ use std::io::{Cursor, Read, Write};
 use std::ops::Add;
 use std::str::from_utf8_mut;
 
-use fake::faker::lorem::en::*;
-use fake::{Dummy, Fake, Faker};
-use getrandom::getrandom;
 use seeder::{ArchiveBuilder, ArchiveFaker, LoremSeeder, RandomSeeder, Seeder};
 use zip::write::FileOptions;
 use zip::SUPPORTED_COMPRESSION_METHODS;
