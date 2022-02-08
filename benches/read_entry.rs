@@ -6,86 +6,13 @@ use std::io::{Cursor, Read, Write};
 use std::ops::Add;
 use std::str::from_utf8_mut;
 
+use fake::faker::lorem::en::*;
+use fake::{Dummy, Fake, Faker};
 use getrandom::getrandom;
-use zip::{CompressionMethod, ZipArchive, ZipWriter};
+use seeder::{ArchiveBuilder, ArchiveFaker, LoremSeeder, RandomSeeder, Seeder};
+use zip::write::FileOptions;
 use zip::SUPPORTED_COMPRESSION_METHODS;
-
-trait Seeder {
-    // TODO: ...
-    fn fill(&self, dest: &mut [u8]);
-
-    fn reset(&mut self);
-}
-
-trait BucketSeeder {
-    fn generate(&mut self);
-    fn get_cache(&mut self) -> &'static mut Vec<u8>;
-    fn get_index(&mut self) -> &'static mut usize;
-    fn reset_index(&mut self);
-}
-
-impl Seeder for BucketSeeder {
-    fn fill(&mut self, dest: &mut [u8]) {
-        let mut cache = self.get_cache();
-
-        loop {
-            let remaining_cache = (cache.len() - self.get_index());
-            if remaining_cache < dest.len() {
-                break;
-            }
-
-            (self.generate());
-        }
-
-        dest.fill(&cache[self.get_index()..])
-    }
-
-    fn reset(&mut self) {
-        self.reset_index();
-    }
-}
-
-struct RandomSeeder {
-    block_size: usize,
-    index: usize,
-}
-
-impl Seeder for RandomSeeder {}
-impl BucketSeeder for RandomSeeder {
-    fn generate(&mut self) {
-        let block = Vec<u8>::with_capacity(self.block_size);
-
-        rand::thread_rng().fill(block);
-        self.get_index().add(self.block_size)
-    }
-}
-
-struct LoremSeeder {}
-
-impl Seeder for LoremSeeder {}
-impl BucketSeeder for LoremSeeder {
-    fn fill(&self, dest: &mut [u8]) {
-        // let mut buf = String::with_capacity(1024);
-        // let count = 100;
-
-        // for chunk in dest.chunks_mut(1024) {
-        //     buf.clear();
-
-        //     let paragraphs = Paragraphs(0..10).fake::<Vec<String>>();
-        //     paragraphs.iter().map(|x| buf.push_str(x));
-
-        //     // loop
-
-        //     buf.truncate(1024);
-        //     chunk.copy_from_slice(&buf.as_bytes());
-
-        //     println!("{}", buf);
-        // }
-        // println!("length: {}", dest.len());
-        // // dest.clear();
-        // // dest.extend()
-    }
-}
+use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
 fn generate_whole_archive(
     in_buffer: &mut Vec<u8>,
@@ -100,41 +27,51 @@ fn generate_whole_archive(
 
     // Generate some random data.
     let mut bytes = vec![0u8; size];
-    getrandom(&mut bytes).unwrap();
+    seeder.fill(bytes.as_mut_slice());
+
     writer.write_all(&bytes).unwrap();
 
     writer.finish();
 }
 
-fn read_entry(bench: &mut Criterion) {
-    let size = 1024 * 1024;
-    let mut group = bench.benchmark_group("read_entry");
-    for &method in SUPPORTED_COMPRESSION_METHODS {
-        #[allow(deprecated)]
-        if method == CompressionMethod::Unsupported(0) {
-            continue;
-        }
+fn read_whole_archive(in_buffer: &[u8]) -> usize {
+    let mut archive = ZipArchive::new(Cursor::new(in_buffer)).unwrap();
+    let mut file = archive.by_name("random.dat").unwrap();
+    let mut buf = [0u8; 1024];
 
-        group.bench_with_input(
+    let mut total_bytes = 0;
+
+    loop {
+        let n = file.read(&mut buf).unwrap();
+        total_bytes += n;
+        if n == 0 {
+            return total_bytes;
+        }
+    }
+}
+
+fn bench_read_whole_all_methods<T>(mut group: BenchmarkGroup<T>, builder: &ArchiveBuilder)
+where
+    T: Measurement,
+{
+    let size = 1024 * 1024;
+
+    for &method in SUPPORTED_COMPRESSION_METHODS {
+        // Write a test versions of the archive for each compression method
+
+        let mut in_buffer = Vec::with_capacity(size);
+        builder
+            .file_options_from(|| FileOptions::default().compression_method(*method))
+            .generate(in_buffer);
+
+        &group.bench_with_input(
             BenchmarkId::from_parameter(method),
-            &method,
+            method,
             |bench, method| {
-                let bytes = generate_random_archive(size, Some(*method));
+                builder.reset();
 
                 bench.iter(|| {
-                    let mut archive = ZipArchive::new(Cursor::new(bytes.as_slice())).unwrap();
-                    let mut file = archive.by_name("random.dat").unwrap();
-                    let mut buf = [0u8; 1024];
-
-                    let mut total_bytes = 0;
-
-                    loop {
-                        let n = file.read(&mut buf).unwrap();
-                        total_bytes += n;
-                        if n == 0 {
-                            return total_bytes;
-                        }
-                    }
+                    let size = read_whole_archive(&in_buffer.as_slice());
                 });
             },
         );
@@ -143,58 +80,35 @@ fn read_entry(bench: &mut Criterion) {
     &group.finish();
 }
 
-fn bench_read_whole_all_methods<T>(mut group: BenchmarkGroup<T>, seeder: &dyn Seeder)
-where
-    T: Measurement,
-{
-    let size = 1024 * 1024;
-    let mut group = bench.benchmark_group("write_random_archive");
-    for &method in SUPPORTED_COMPRESSION_METHODS {
-        #[allow(deprecated)]
-        if method == CompressionMethod::Unsupported(0) {
-            continue;
-        }
-
-        group.bench_with_input(BenchmarkId::from_parameter(method), &method, |b, method| {
-            b.iter(|| {
-                generate_random_archive(size, Some(*method));
-            })
-        });
-    }
-
-    &group.finish();
-}
-
-fn bench_random_archive(bench: &mut Criterion) {
+fn bench_read_lorem(bench: &mut Criterion) {
     let size = 1024 * 1024;
 
-    bench_read_whole_all_methods(
-        bench.benchmark_group("write_random_archive"),
-        &mut RandomSeeder {
-            block_size: 1024,
-            index: 0
-        },
-    );
+    // Generate a source of truth archive...
+    let file = &mut Cursor::new(Vec::new());
+    ArchiveFaker::fake_archive()
+        .file_names_from(|i: i32| -> i32 { i + 1 })
+        .file_data_from(LoremSeeder::fill)
+        .build(file);
 
-    bench_write_whole_all_methods(
-        bench.benchmark_group("read_random_archive"),
-        &mut RandomSeeder {
-            block_size: 1024,
-            index: 0
-        },
-    );
+    // Read the test archive with all methods.
+    bench_read_whole_all_methods(bench.benchmark_group("read_lorem_archive"), file);
 }
 
-fn bench_lorem_archive(bench: &mut Criterion) {
+fn bench_read_random(bench: &mut Criterion) {
     let size = 1024 * 1024;
 
-    bench_read_whole_all_methods(
-        bench.benchmark_group("write_lorem_archive"),
-        &LoremSeeder {},
-    );
+    // Generate a test archive...
+    let file = &mut Cursor::new(Vec::new());
+    ArchiveFaker::fake_archive()
+        .file_names_from(|i: i32| -> i32 { i + 1 })
+        .file_data_from(RandomSeeder::fill)
+        .build(file);
 
-    bench_write_whole_all_methods(bench.benchmark_group("read_lorem_archive"), &LoremSeeder {});
+    // Write test versions of the archive for each compression method
+
+    // Read the test archive with all methods.
+    bench_read_whole_all_methods(bench.benchmark_group("read_random_archive"), file);
 }
 
-criterion_group!(benches, bench_lorem_archive);
+criterion_group!(benches, bench_read_lorem, bench_read_random);
 criterion_main!(benches);
